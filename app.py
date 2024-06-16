@@ -1,10 +1,17 @@
-from flask import render_template, request, send_file, redirect, url_for
+from flask import render_template, request, send_file, redirect, url_for, jsonify
 from PyPDF2 import PdfReader, PdfWriter
 import io
+import pika
+import json
+from app import app, db, cache
+from app.models.commands import CompressedPDFCommand
 
-from app import app, db
-from app.command_handlers.pdf_handler import handle_compress_pdf_command
-from app.query_handlers.pdf_handler import handle_get_compressed_pdf_query
+# Set up RabbitMQ connection
+connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+channel = connection.channel()
+
+# Declare a queue for compression tasks
+channel.queue_declare(queue='compression_tasks')
 
 @app.route('/')
 def index():
@@ -13,33 +20,59 @@ def index():
 @app.route('/upload', methods=['POST'])
 def upload_file():
     uploaded_file = request.files['file']
-    if uploaded_file.filename != '':
-        pdf_reader = PdfReader(uploaded_file)
-        pdf_writer = PdfWriter()
-        for page_num in range(len(pdf_reader.pages)):
-            page = pdf_reader.pages[page_num]
-            pdf_writer.add_page(page)
-        compressed_pdf = io.BytesIO()
-        pdf_writer.write(compressed_pdf)
-        compressed_pdf.seek(0)
+    file_data = uploaded_file.read()
+    
+    # Check if file already exists in DB
+    existing_file = db.session.query(CompressedPDFCommand).filter_by(filename=uploaded_file.filename).first()
+    if existing_file:
+        # Send task to RabbitMQ queue to cache the existing file
+        task_message = {
+            'task_id': existing_file.id,  # Use existing file ID
+            'filename': uploaded_file.filename,
+            'filedata': file_data.decode('latin-1')
+        }
+        channel.basic_publish(exchange='',
+                              routing_key='compression_tasks',
+                              body=json.dumps(task_message))
+        return redirect(url_for('download_compressed_pdf', task_id=existing_file.id))
 
-        file_id = handle_compress_pdf_command('compressed_' + uploaded_file.filename, compressed_pdf.read())
+    # Create a new CompressedPDFCommand instance
+    new_file = CompressedPDFCommand(filename=uploaded_file.filename, data=file_data)
+    db.session.add(new_file)
+    db.session.commit()
+    
+    # Send task to RabbitMQ queue
+    task_message = {
+        'task_id': new_file.id,  # Assuming 'id' is the primary key in your database model
+        'filename': uploaded_file.filename,
+        'filedata': file_data.decode('latin-1')
+    }
+    channel.basic_publish(exchange='',
+                          routing_key='compression_tasks',
+                          body=json.dumps(task_message))
 
-        return redirect(url_for('download_file', file_id=file_id))
+    return redirect(url_for('download_compressed_pdf', task_id=new_file.id))
 
-    return 'No file has been uploaded.', 400
-
-@app.route('/download/<int:file_id>')
-def download_file(file_id):
-    file_data = handle_get_compressed_pdf_query(file_id)
-    if file_data:
+@app.route('/download/<int:task_id>')
+def download_compressed_pdf(task_id):
+    compressed_data = cache.get(f'file_{task_id}')
+    if compressed_data:
         return send_file(
-            io.BytesIO(file_data.data),
+            io.BytesIO(compressed_data),
             as_attachment=True,
-            attachment_filename=file_data.filename,
+            attachment_filename=f"compressed_{task_id}.pdf",
             mimetype='application/pdf'
         )
-    return 'File not found.', 404
+
+    file_record = CompressedPDFCommand.query.get(task_id)
+    if file_record:
+        return send_file(
+            io.BytesIO(file_record.data),
+            as_attachment=True,
+            attachment_filename=f"compressed_{file_record.filename}",
+            mimetype='application/pdf'
+        )
+    return "File not found", 404
 
 if __name__ == '__main__':
     db.create_all()
